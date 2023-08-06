@@ -1,15 +1,25 @@
-// Configuration
-#define SERVER_URL "http://yourserver.com/api/gps-data"
-#define SIM7000G_TX_PIN 7
-#define SIM7000G_RX_PIN 8
-#define BAUD_RATE 9600
-#define SLEEP_TIME_MS 60000  // Sleep for 60 seconds
-#define MOVEMENT_THRESHOLD 10.0  // Movement threshold (in meters)
-#define MIN_SATELLITES 4  // Minimum number of satellites for reliable GPS data
-#define CHECK_INTERVAL_MS 10000  // Check cellular network connection every 10 seconds
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+#include <ESPAsyncWebServer.h>
+#include <EEPROM.h>
 
-// Instantiate SoftwareSerial and TinyGPSPlus
-SoftwareSerial ss(SIM7000G_TX_PIN, SIM7000G_RX_PIN);
+#define EEPROM_SIZE 512
+#define CONFIG_START 0
+
+// Config struct to store in EEPROM
+struct Config {
+  char serverUrl[128];
+  int sim7000gTxPin;
+  int sim7000gRxPin;
+  int baudRate;
+  unsigned long sleepTimeMs;
+  float movementThreshold;
+  int minSatellites;
+  unsigned long checkIntervalMs;
+};
+
+Config config;
+
 TinyGPSPlus gps;
 
 // Variables to store the last known location
@@ -20,26 +30,69 @@ float lastLongitude = 0.0;
 MovingAverage<float> latAvg(5);  // Window size of 5
 MovingAverage<float> lonAvg(5);  // Window size of 5
 
+AsyncWebServer server(80);
+
 void setup() {
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+
+  // Load config from EEPROM
+  EEPROM.get(CONFIG_START, config);
+
   // Setup serial communication
-  Serial.begin(BAUD_RATE);
-  ss.begin(BAUD_RATE);
+  SoftwareSerial ss(config.sim7000gTxPin, config.sim7000gRxPin);
+  ss.begin(config.baudRate);
 
   // Setup SIM7000G module for GPS
-  ss.println("AT+CGNSPWR=1");  // Turn on GNSS power supply
+  ss.println("AT+CGNSPWR=1");
   delay(100);
 
   // Check cellular network connection
-  ss.println("AT+CREG?");  // Check network registration status
+  ss.println("AT+CREG?");
   delay(100);
+
+  // Setup the web server
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Send a form to enter new config values
+    String html = "<form method='POST' action='/set-config'>";
+    html += "Server URL: <input type='text' name='serverUrl' value='" + String(config.serverUrl) + "'><br>";
+    html += "SIM7000G TX Pin: <input type='number' name='sim7000gTxPin' value='" + String(config.sim7000gTxPin) + "'><br>";
+    html += "Sleep Time in MS: <input type='number' name='sleepTimeMs' value='" + String(config.sleepTimeMs) + "'><br>";
+    html += "Movement Threshold: <input type='number' step='0.01' name='movementThreshold' value='" + String(config.movementThreshold) + "'><br>";
+    html += "Minimum Satellites: <input type='number' name='minSatellites' value='" + String(config.minSatellites) + "'><br>";
+    html += "Check Interval MS: <input type='number' name='checkIntervalMs' value='" + String(config.checkIntervalMs) + "'><br>";
+    html += "<input type='submit' value='Set Config'>";
+    html += "</form>";
+    request->send(200, "text/html", html);
+  });
+
+  server.on("/set-config", HTTP_POST, [](AsyncWebServerRequest *request) {
+    // Update config with new values from the form
+    String serverUrl = request->getParam("serverUrl", true)->value();
+    strncpy(config.serverUrl, serverUrl.c_str(), sizeof(config.serverUrl));
+    config.sim7000gTxPin = request->getParam("sim7000gTxPin", true)->value().toInt();
+    config.sleepTimeMs = request->getParam("sleepTimeMs", true)->value().toInt();
+    config.movementThreshold = request->getParam("movementThreshold", true)->value().toFloat();
+    config.minSatellites = request->getParam("minSatellites", true)->value().toInt();
+    config.checkIntervalMs = request->getParam("checkIntervalMs", true)->value().toInt();
+
+    // Save config to EEPROM
+    EEPROM.put(CONFIG_START, config);
+    EEPROM.commit();
+
+    // Redirect back to the form
+    request->redirect("/");
+  });
+
+  server.begin();
 }
 
 void loop() {
   while (ss.available() > 0) {
     gps.encode(ss.read());
     if (gps.location.isUpdated()) {
-      // Check if connected to at least MIN_SATELLITES
-      if (gps.satellites.value() < MIN_SATELLITES) {
+      // Check if connected to at least config.minSatellites
+      if (gps.satellites.value() < config.minSatellites) {
         Serial.println("Not enough satellites, waiting for better signal...");
         continue;
       }
@@ -62,7 +115,7 @@ void loop() {
       );
 
       // Only send data if movement is greater than the threshold
-      if (distanceMoved > MOVEMENT_THRESHOLD) {
+      if (distanceMoved > config.movementThreshold) {
         // Send GPS data to the server
         Serial.println("Sending GPS data to the server...");
 
@@ -75,8 +128,8 @@ void loop() {
       ss.println("AT+CSCLK=1");
       delay(100);
       
-      // Sleep for SLEEP_TIME_MS milliseconds before getting the next GPS reading
-      delay(SLEEP_TIME_MS);
+      // Sleep for config.sleepTimeMs milliseconds before getting the next GPS reading
+      delay(config.sleepTimeMs);
       
       // Wake up SIM7000G
       ss.println("AT+CSCLK=0");
@@ -86,8 +139,8 @@ void loop() {
 
   // Check cellular network connection periodically
   static unsigned long lastCheckTime = 0;
-  if (millis() - lastCheckTime > CHECK_INTERVAL_MS) {
-    ss.println("AT+CREG?");  // Check network registration status
+  if (millis() - lastCheckTime > config.checkIntervalMs) {
+    ss.println("AT+CREG?");
     delay(100);
     lastCheckTime = millis();
   }
